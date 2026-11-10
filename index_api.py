@@ -162,6 +162,34 @@ def address_transactions(addr):
     return jsonify({"result": rows, "next": nxt})
 
 
+INCOMING_MAX_ADDRS = 20
+ADDRESS_CHARS = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+
+@bp.route("/incoming")
+def incoming():
+    """payments (DEBIT contracts) sent to these accounts, newest first: addr=A&addr=B; a wallet that holds no
+    login on a node asks the node per txid whether each is claimed (ledger/get/transaction shows claimed)"""
+    addrs = [a for a in request.args.getlist("addr") if len(a) == 51 and set(a) <= ADDRESS_CHARS][:INCOMING_MAX_ADDRS]
+    if not addrs:
+        return jsonify({"error": {"code": -1, "message": "give one or more account addresses as addr"}}), 400
+    con = db()
+    if not con:
+        return unavailable()
+    limit = arg_int("limit", 100, 1, MAX_LIMIT)
+    before = arg_int("before", 2 ** 31)
+    marks = ",".join("?" * len(addrs))
+    with con:
+        rows = con.execute(
+            f"SELECT txid, idx, height, time, from_addr, from_name, to_addr, to_name, amount, ticker FROM moves "
+            f"WHERE op = 'DEBIT' AND to_addr IN ({marks}) AND height < ? ORDER BY height DESC LIMIT ?",
+            (*addrs, before, limit + 1),
+        ).fetchall()
+    more = len(rows) > limit
+    rows = [dict(r) for r in rows[:limit]]
+    return jsonify({"result": rows, "next": rows[-1]["height"] if more else None})
+
+
 @bp.route("/address/<addr>/rewards")
 def address_rewards(addr):
     """Staking rewards of a trust account per UTC month: [month, rewards, NXS]"""
