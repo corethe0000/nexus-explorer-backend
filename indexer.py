@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS txs_transfer ON txs(is_reward, height);
 CREATE TABLE IF NOT EXISTS moves (
   txid TEXT, idx INTEGER, height INTEGER, time INTEGER, op TEXT,
   from_addr TEXT, from_name TEXT, to_addr TEXT, to_name TEXT,
-  amount REAL, ticker TEXT, PRIMARY KEY (txid, idx));
+  amount REAL, ticker TEXT, recipient TEXT, PRIMARY KEY (txid, idx));
 CREATE INDEX IF NOT EXISTS moves_from ON moves(from_addr, height);
 CREATE INDEX IF NOT EXISTS moves_to ON moves(to_addr, height);
 CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, updated INTEGER, data TEXT);
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS daily (
 NEW_INDEX_DONE = ("tx_kinds_filled", "legacy_rewards_fixed", "migrate_moves_fixed",
                   "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_tritium_inputs",
                   "tritium_inputs_low",
-                  "legacy_inputs_from_start")
+                  "legacy_inputs_from_start", "transfer_recipients_filled")
 
 
 def legacy_inputs_low(db):
@@ -98,6 +98,10 @@ def connect(path=INDEX_DB):
     if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
         db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
+    #moves made before the recipient column (profile a TRANSFER sends a register to)
+    if "recipient" not in [c[1] for c in db.execute("PRAGMA table_info(moves)")]:
+        db.execute("ALTER TABLE moves ADD COLUMN recipient TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS moves_recipient ON moves(recipient, height) WHERE recipient IS NOT NULL")
     #txs made before the kind column
     if "kind" not in [c[1] for c in db.execute("PRAGMA table_info(txs)")]:
         db.execute("ALTER TABLE txs ADD COLUMN kind TEXT")
@@ -121,6 +125,11 @@ def connect(path=INDEX_DB):
             log.warning("token kind fix postponed: %s", str(e).split(" for url:")[0])
     if get_meta(db, "mixed_token_kinds_fixed") is None:
         fix_mixed_token_kinds(db)
+    if get_meta(db, "transfer_recipients_filled") is None:
+        try:
+            fill_transfer_recipients(db)
+        except UNREADABLE as e:
+            log.warning("TRANSFER recipients postponed: %s", str(e).split(" for url:")[0])
     #inputs spending what a Tritium account sent to a legacy address were not stored: read
     #the legacy blocks above LEGACY_DENSE_BELOW again, and drop the balances made without them
     if get_meta(db, "legacy_tritium_inputs") is None:
@@ -145,6 +154,18 @@ def fix_migrate_moves(db):
                 db.execute("UPDATE moves SET to_addr = ?, to_name = ? WHERE txid = ? AND idx = ?",
                            (c.get("address"), c.get("name"), txid, i))
     set_meta(db, "migrate_moves_fixed", 1)
+    db.commit()
+
+
+def fill_transfer_recipients(db):
+    """Indexes made before the recipient column stored TRANSFER moves without the receiving profile"""
+    for (txid,) in db.execute("SELECT DISTINCT txid FROM moves WHERE op = 'TRANSFER' AND recipient IS NULL").fetchall():
+        tx = api("ledger/get/transaction", txid=txid, verbose="summary")
+        for i, c in enumerate(tx.get("contracts") or []):
+            if c.get("OP") == "TRANSFER" and c.get("recipient"):
+                db.execute("UPDATE moves SET recipient = ? WHERE txid = ? AND idx = ?",
+                           (str(c["recipient"]).lower(), txid, i))
+    set_meta(db, "transfer_recipients_filled", 1)
     db.commit()
 
 
@@ -229,7 +250,7 @@ def is_reward(tx):
 
 
 def moves_of(tx):
-    """(op, from, from_name, to, to_name, amount, ticker) per contract or legacy output"""
+    """(op, from, from_name, to, to_name, amount, ticker, recipient) per contract or legacy output"""
     out = []
     for c in tx.get("contracts") or []:
         op = c.get("OP", "")
@@ -242,11 +263,12 @@ def moves_of(tx):
             t = c.get("genesis")
         elif op in ("CREATE", "WRITE", "APPEND", "TRANSFER", "CLAIM") and c.get("address"):
             t, tn = c.get("address"), c.get("name")
-        out.append((op, f, fn, t, tn, c.get("amount"), c.get("ticker")))
+        recipient = str(c["recipient"]).lower() if op == "TRANSFER" and c.get("recipient") else None
+        out.append((op, f, fn, t, tn, c.get("amount"), c.get("ticker"), recipient))
     #legacy (pre Tritium) transactions carry inputs / outputs instead of contracts
     for o in tx.get("outputs") or []:
         if isinstance(o, dict):
-            out.append(("LEGACY", None, None, o.get("address"), None, o.get("amount"), "NXS"))
+            out.append(("LEGACY", None, None, o.get("address"), None, o.get("amount"), "NXS", None))
     #an input spends an earlier output of that address; an output a Tritium account sent
     #(LEGACY contract) comes as that contract, the spent address is its "to"
     for i in tx.get("inputs") or []:
@@ -254,7 +276,7 @@ def moves_of(tx):
             continue
         spent = i.get("address") or party(i.get("to"))[0]
         if spent:
-            out.append(("LEGACY_IN", spent, None, None, None, i.get("amount"), "NXS"))
+            out.append(("LEGACY_IN", spent, None, None, None, i.get("amount"), "NXS", None))
     return out
 
 
@@ -318,7 +340,8 @@ def store_block(db, b):
                    (tx["txid"], b["height"], tx.get("timestamp"), tx.get("type"),
                     len(tx.get("contracts") or []), reward, amount, ticker, ops,
                     tx_kind(tx.get("type"), reward, ops, ticker, moves_token(tx))))
-        db.executemany("INSERT OR REPLACE INTO moves VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        db.executemany("INSERT OR REPLACE INTO moves (txid, idx, height, time, op, from_addr, from_name, to_addr, "
+                       "to_name, amount, ticker, recipient) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                        [(tx["txid"], i, b["height"], tx.get("timestamp"), *m) for i, m in enumerate(mv)])
 
 
@@ -337,12 +360,32 @@ def set_meta(db, key, value):
     db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 
 
-def get_block(height):
-    """one block; if the node cannot decode a transaction, keep the others and mark that one"""
+#None until asked; false on a node started without -indexheight (blocks by height answer -85,
+#ledger/list/blocks ignores offset): blocks are then read one by one along previousblockhash
+by_height = None
+
+
+def height_index():
+    global by_height
+    if by_height is None:
+        try:
+            api("ledger/get/block", height=1, verbose="summary")
+            by_height = True
+        except requests.HTTPError as e:
+            if e.response is None or '"code":-85' not in e.response.text.replace(" ", ""):
+                raise
+            by_height = False
+            log.info("node has no height index, reading blocks along previousblockhash")
+    return by_height
+
+
+def get_block(height=None, hash=None):
+    """one block by height or hash; if the node cannot decode a transaction, keep the others and mark that one"""
+    key = {"height": height} if hash is None else {"hash": hash}
     try:
-        return api("ledger/get/block", height=height, verbose="summary")
+        return api("ledger/get/block", verbose="summary", **key)
     except UNREADABLE:
-        b = api("ledger/get/block", height=height)
+        b = api("ledger/get/block", **key)
     txs = []
     for t in b.get("tx") or []:
         txid = t if isinstance(t, str) else t.get("txid")
@@ -350,10 +393,23 @@ def get_block(height):
             txs.append(api("ledger/get/transaction", txid=txid, verbose="summary"))
         except UNREADABLE:
             tip_height()  #raises if the node itself is down, so we retry later instead
-            log.warning("block %s: node cannot read tx %s", height, txid)
+            log.warning("block %s: node cannot read tx %s", b.get("height"), txid)
             txs.append({"txid": txid, "timestamp": b.get("timestamp"), "type": "unreadable"})
     b["tx"] = txs
     return b
+
+
+def blocks_below(block, count):
+    """up to count blocks under this one, newest first, along previousblockhash"""
+    out = []
+    while len(out) < count and block.get("height", 0) > 1 and block.get("previousblockhash"):
+        block = get_block(hash=block["previousblockhash"])
+        out.append(block)
+    return out
+
+
+def tip_block():
+    return get_block(hash=api("ledger/list/blocks", limit=1, verbose="summary")[0]["hash"])
 
 
 def list_blocks(page):
@@ -361,6 +417,8 @@ def list_blocks(page):
     try:
         return api("ledger/list/blocks", verbose="summary", limit=PAGE, page=page)
     except UNREADABLE:
+        if not height_index():
+            raise
         top = tip_height() - page * PAGE
         return [get_block(h) for h in range(top, max(0, top - PAGE), -1)]
 
@@ -371,6 +429,8 @@ def tip_height():
 
 def follow_tip(db):
     """Index blocks above the highest stored one, newest page first"""
+    if not height_index():
+        return follow_tip_by_hash(db)
     tip = tip_height()
     top = db.execute("SELECT MAX(height), (SELECT hash FROM blocks ORDER BY height DESC LIMIT 1) FROM blocks").fetchone()
     high, high_hash = top
@@ -397,6 +457,35 @@ def follow_tip(db):
         if len(new) < len(blocks) or not blocks:
             break
         page += 1
+    db.commit()
+
+
+def follow_tip_by_hash(db):
+    high, high_hash = db.execute(
+        "SELECT MAX(height), (SELECT hash FROM blocks ORDER BY height DESC LIMIT 1) FROM blocks").fetchone()
+    tip = tip_block()
+    new = [tip]
+    if high is None:
+        new += blocks_below(tip, PAGE - 1)
+    else:
+        while new[-1]["height"] > high + 1:
+            below = blocks_below(new[-1], 1)
+            if not below:
+                break
+            new += below
+        if tip["height"] <= high:
+            new = []
+        #the block under the new ones must be our top block, else the chain changed under us
+        prev = new[-1]["previousblockhash"] if new else (tip["hash"] if tip["height"] == high else None)
+        if prev is not None and prev != high_hash:
+            log.warning("reorg at %s, dropping last %s blocks", high, REORG_DEPTH)
+            delete_from(db, high - REORG_DEPTH)
+            db.commit()
+            return
+    for b in new:
+        store_block(db, b)
+    if high is None and new:
+        set_meta(db, "backfill_low", min(b["height"] for b in new))
     db.commit()
 
 
@@ -487,6 +576,20 @@ def walk_down(db, key, budget_seconds):
     if low <= 1:
         return False
     start = time.time()
+    if not height_index():
+        row = db.execute("SELECT hash FROM blocks WHERE height = ?", (low,)).fetchone()
+        block = get_block(hash=row[0]) if row else None
+        while block and low > 1 and time.time() - start < budget_seconds:
+            below = blocks_below(block, 10)
+            if not below:
+                break
+            for b in below:
+                store_block(db, b)
+            block = below[-1]
+            low = block["height"]
+            set_meta(db, key, low)
+            db.commit()
+        return True
     while low > 1 and time.time() - start < budget_seconds:
         tip = tip_height()
         page = max(0, (tip - (low - 1)) // PAGE)

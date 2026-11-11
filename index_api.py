@@ -6,7 +6,7 @@ import time
 
 from flask import Blueprint, jsonify, request
 
-from indexer import LARGEST_PERIODS, LARGEST_ROWS, REWARD_OPS, TX_KINDS, api, legacy_inputs_low
+from indexer import LARGEST_PERIODS, LARGEST_ROWS, REWARD_OPS, TX_KINDS, api, get_meta, legacy_inputs_low
 
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
@@ -163,31 +163,43 @@ def address_transactions(addr):
 
 
 INCOMING_MAX_ADDRS = 20
+HEX_CHARS = set("0123456789abcdef")
 ADDRESS_CHARS = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 @bp.route("/incoming")
 def incoming():
-    """payments (DEBIT contracts) sent to these accounts, newest first: addr=A&addr=B; a wallet that holds no
-    login on a node asks the node per txid whether each is claimed (ledger/get/transaction shows claimed)"""
+    """what was sent to a wallet, newest first: payments (DEBIT) to its accounts addr=A&addr=B and registers
+    (TRANSFER: assets, invoices) to its profile genesis=G; a wallet that holds no login on a node asks the
+    node per txid whether each is still open. "transfers" is false while the index has no recipients yet"""
     addrs = [a for a in request.args.getlist("addr") if len(a) == 51 and set(a) <= ADDRESS_CHARS][:INCOMING_MAX_ADDRS]
-    if not addrs:
-        return jsonify({"error": {"code": -1, "message": "give one or more account addresses as addr"}}), 400
+    genesis = request.args.get("genesis", "").lower()
+    if len(genesis) != 64 or not set(genesis) <= HEX_CHARS:
+        genesis = None
+    if not addrs and not genesis:
+        return jsonify({"error": {"code": -1, "message": "give account addresses as addr or a profile as genesis"}}), 400
     con = db()
     if not con:
         return unavailable()
     limit = arg_int("limit", 100, 1, MAX_LIMIT)
     before = arg_int("before", 2 ** 31)
-    marks = ",".join("?" * len(addrs))
+    cols = "op, txid, idx, height, time, from_addr, from_name, to_addr, to_name, amount, ticker"
+    rows = []
     with con:
-        rows = con.execute(
-            f"SELECT txid, idx, height, time, from_addr, from_name, to_addr, to_name, amount, ticker FROM moves "
-            f"WHERE op = 'DEBIT' AND to_addr IN ({marks}) AND height < ? ORDER BY height DESC LIMIT ?",
-            (*addrs, before, limit + 1),
-        ).fetchall()
+        transfers = bool(get_meta(con, "transfer_recipients_filled"))
+        if addrs:
+            marks = ",".join("?" * len(addrs))
+            rows += con.execute(
+                f"SELECT {cols} FROM moves WHERE op = 'DEBIT' AND to_addr IN ({marks}) AND height < ? "
+                "ORDER BY height DESC LIMIT ?", (*addrs, before, limit + 1)).fetchall()
+        if genesis and transfers:
+            rows += con.execute(
+                f"SELECT {cols}, recipient FROM moves WHERE recipient = ? AND op = 'TRANSFER' AND height < ? "
+                "ORDER BY height DESC LIMIT ?", (genesis, before, limit + 1)).fetchall()
+    rows = sorted((dict(r) for r in rows), key=lambda r: (r["height"], r["idx"]), reverse=True)
     more = len(rows) > limit
-    rows = [dict(r) for r in rows[:limit]]
-    return jsonify({"result": rows, "next": rows[-1]["height"] if more else None})
+    rows = rows[:limit]
+    return jsonify({"result": rows, "next": rows[-1]["height"] if more else None, "transfers": transfers})
 
 
 @bp.route("/address/<addr>/rewards")
