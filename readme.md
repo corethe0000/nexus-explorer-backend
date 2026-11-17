@@ -75,6 +75,7 @@ WantedBy=multi-user.target
 - `GET /explorer/register/<64 hex>` - base58 address of a register given in hex, the form the node uses for the owner of a tokenized register (owned by a token)
 - `GET /explorer/owner/<genesis>` - accounts, trust accounts, tokens, assets, names and namespaces owned by one signature chain (hourly owner index, up to 1000 rows, `total` = all)
 - `GET /explorer/owner/<genesis>/transactions?limit=25&transfers=1&before=<height>` - value moves to or from any account, trust account or token of that signature chain, newest first; `addresses` = the chain's registers counted, `next` = cursor
+- `GET /explorer/incoming?addr=<account>&addr=<account>&genesis=<genesis>&limit=100&before=<height>` - what was sent to a wallet, newest first: payments (DEBIT) to its accounts (`addr`, up to 20) and registers (assets, invoices) transferred to its profile (`genesis`), for wallets that hold no login on a node and ask the node per txid whether each is still open; `transfers` = false while the index has no recipients yet (an older index fills them once at indexer start), `next` = cursor
 - `GET /explorer/search?q=<text>` - tokens, global names, namespaces and assets whose name starts with the text (any case), exact matches first, up to 50
 - `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics|markets|assets|tokenholders|daily|richchains|legacyrich>`
 
